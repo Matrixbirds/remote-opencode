@@ -19,6 +19,21 @@ export async function handleInteraction(interaction: Interaction) {
     }
     return;
   }
+
+  if (interaction.isAutocomplete()) {
+    const command = commands.get(interaction.commandName);
+    if (command?.autocomplete) {
+      try {
+        await command.autocomplete(interaction);
+      } catch (error) {
+        console.error(`Error handling autocomplete for ${interaction.commandName}:`, error);
+        if (!interaction.responded) {
+          await interaction.respond([]);
+        }
+      }
+    }
+    return;
+  }
   
   if (!interaction.isChatInputCommand()) return;
   

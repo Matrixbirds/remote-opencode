@@ -1,12 +1,31 @@
 import { 
   SlashCommandBuilder, 
-  ChatInputCommandInteraction, 
+  ChatInputCommandInteraction,
+  AutocompleteInteraction,
   MessageFlags,
   ThreadChannel
 } from 'discord.js';
 import { execSync } from 'node:child_process';
 import * as dataStore from '../services/dataStore.js';
 import type { Command } from './index.js';
+
+let cachedModels: string[] = [];
+let cacheTimestamp = 0;
+const CACHE_TTL_MS = 30_000;
+
+function getCachedModels(): string[] {
+  const now = Date.now();
+  if (now - cacheTimestamp > CACHE_TTL_MS || cachedModels.length === 0) {
+    try {
+      const output = execSync('opencode models', { encoding: 'utf-8', timeout: 5000 });
+      cachedModels = output.split('\n').filter(m => m.trim());
+      cacheTimestamp = now;
+    } catch {
+      // Return stale cache on failure, or empty if no cache exists
+    }
+  }
+  return cachedModels;
+}
 
 function getEffectiveChannelId(interaction: ChatInputCommandInteraction): string {
   const channel = interaction.channel;
@@ -31,7 +50,8 @@ export const model: Command = {
         .addStringOption(option =>
           option.setName('name')
             .setDescription('The model name (e.g., google/gemini-2.0-flash)')
-            .setRequired(true))) as SlashCommandBuilder,
+            .setRequired(true)
+            .setAutocomplete(true))) as SlashCommandBuilder,
 
   async execute(interaction: ChatInputCommandInteraction) {
     const subcommand = interaction.options.getSubcommand();
@@ -56,24 +76,31 @@ export const model: Command = {
         }
 
         let response = '### 🤖 Available Models\n\n';
+        let isFirstMessage = true;
+
         for (const [provider, providerModels] of Object.entries(groups)) {
-          response += `**${provider}**\n`;
-          // Limit to 10 models per provider to avoid hitting discord message limit
-          const displayModels = providerModels.slice(0, 10);
-          response += displayModels.map(m => `• \`${m}\``).join('\n') + '\n';
-          if (providerModels.length > 10) {
-            response += `*...and ${providerModels.length - 10} more*\n`;
-          }
-          response += '\n';
-          
-          if (response.length > 1800) {
-            await interaction.followUp({ content: response, flags: MessageFlags.Ephemeral });
+          const providerBlock = `**${provider}**\n` +
+            providerModels.map(m => `• \`${m}\``).join('\n') + '\n\n';
+
+          if (response.length + providerBlock.length > 1800 && response.length > 0) {
+            if (isFirstMessage) {
+              await interaction.editReply(response);
+              isFirstMessage = false;
+            } else {
+              await interaction.followUp({ content: response, flags: MessageFlags.Ephemeral });
+            }
             response = '';
           }
+
+          response += providerBlock;
         }
 
         if (response) {
-          await interaction.editReply(response);
+          if (isFirstMessage) {
+            await interaction.editReply(response);
+          } else {
+            await interaction.followUp({ content: response, flags: MessageFlags.Ephemeral });
+          }
         }
       } catch (error) {
         console.error('Failed to list models:', error);
@@ -95,16 +122,14 @@ export const model: Command = {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       try {
-        const output = execSync('opencode models', { encoding: 'utf-8', timeout: 10000 });
-        const availableModels = output.split('\n').filter(m => m.trim());
-        if (!availableModels.includes(modelName)) {
+        const availableModels = getCachedModels();
+        if (availableModels.length > 0 && !availableModels.includes(modelName)) {
           await interaction.editReply(
             `❌ Model \`${modelName}\` not found.\nUse \`/model list\` to see available models.`
           );
           return;
         }
       } catch {
-        // If opencode CLI is unavailable or times out, warn but allow setting the model
         console.warn('[model] Could not validate model name against opencode models');
       }
 
@@ -114,5 +139,18 @@ export const model: Command = {
         `✅ Model for this channel set to \`${modelName}\`.\nSubsequent commands will use this model.`
       );
     }
+  },
+
+  async autocomplete(interaction: AutocompleteInteraction) {
+    const focused = interaction.options.getFocused().toLowerCase();
+    const models = getCachedModels();
+
+    const filtered = models
+      .filter(m => m.toLowerCase().includes(focused))
+      .slice(0, 25);
+
+    await interaction.respond(
+      filtered.map(m => ({ name: m, value: m }))
+    );
   }
 };
